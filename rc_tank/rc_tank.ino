@@ -1,5 +1,8 @@
 #include <Bluepad32.h>
 
+// ===== LED PINS =====
+#define LED_BUILTIN 2   // built-in LED ESP32
+
 // ===== TB6612 PINS =====
 #define AIN1 18
 #define AIN2 19
@@ -52,17 +55,23 @@ void tankDrive(int left, int right) {
 void onConnectedController(ControllerPtr ctl) {
     Serial.println("Controller connesso");
     controller = ctl;
+    digitalWrite(LED_BUILTIN, HIGH);  // LED ON
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
     Serial.println("Controller disconnesso");
     controller = nullptr;
+    digitalWrite(LED_BUILTIN, LOW);   // LED OFF
     tankDrive(0, 0);  // sicurezza: stop
 }
 
 // --------------------------------------------------
 void setup() {
     Serial.begin(115200);
+
+    // 
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);  // spento all'avvio
 
     // TB6612 setup
     pinMode(AIN1, OUTPUT);
@@ -92,24 +101,23 @@ void loop() {
 
     if (controller && controller->isConnected()) {
 
-        // Assi joystick
-        int leftY  = controller->axisY();   // joystick sinistro Y
-        int rightY = controller->axisRY();  // joystick destro Y
+        int rawLeftY  = -controller->axisY();
+        int rawRightY = -controller->axisRY();
 
-        // Invertiamo Y (su molti controller su = negativo)
-        leftY  = -leftY;
-        rightY = -rightY;
+        int leftSpeed  = map(rawLeftY,  -512, 512, -255, 255);
+        int rightSpeed = map(rawRightY, -512, 512, -255, 255);
 
-        // Mappa -511..512 → -255..255
-        int leftSpeed  = map(leftY,  -512, 512, -255, 255);
-        int rightSpeed = map(rightY, -512, 512, -255, 255);
-
-        // Deadzone
         if (abs(leftSpeed)  < 20) leftSpeed  = 0;
         if (abs(rightSpeed) < 20) rightSpeed = 0;
 
-        tankDrive(leftSpeed, rightSpeed);
-    }
+        Serial.printf(
+            "MAP | L:%4d -> %4d   R:%4d -> %4d\n",
+            rawLeftY, leftSpeed,
+            rawRightY, rightSpeed
+        );
 
-    delay(10);
+        tankDrive(leftSpeed, rightSpeed);
+
+        delay(100);
+    }
 }
