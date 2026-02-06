@@ -1,211 +1,219 @@
-#include <Bluepad32.h>   // Library that handles Bluetooth HID controllers (PS4, Xbox, etc.)
-
+#include <Bluepad32.h>
 
 // ==================================================
 // STATUS LED
 // ==================================================
-// Built-in LED on most ESP32 boards.
-// We'll use it to indicate:
-// - OFF  → no controller connected
-// - ON   → controller connected
 #define LED_BUILTIN 2
-
 
 // ==================================================
 // TB6612 MOTOR DRIVER PINS
 // ==================================================
-// Left motor
-#define AIN1 18      // Left motor direction
-#define AIN2 19      // Left motor direction
-#define PWMA 23      // Left motor PWM speed
+#define AIN1 18
+#define AIN2 19
+#define PWMA 23
 
-// Right motor
-#define BIN1 25      // Right motor direction
-#define BIN2 26      // Right motor direction
-#define PWMB 27      // Right motor PWM speed
+#define BIN1 25
+#define BIN2 26
+#define PWMB 27
 
-// TB6612 Standby: must be HIGH to enable motors
 #define STBY 14
 
+// ==================================================
+// PWM CONFIGURATION
+// ==================================================
+#define PWM_LEFT_CH   0
+#define PWM_RIGHT_CH  1
+
+#define PWM_FREQ   1000
+#define PWM_RES    8
 
 // ==================================================
-// PWM CONFIGURATION (ESP32 LEDC)
+// MT6701 PWM INPUT PINS
 // ==================================================
-// We'll use two ESP32 hardware PWM channels
-// - one for left motor
-// - one for right motor
-#define PWM_LEFT   0
-#define PWM_RIGHT  1
-
-#define PWM_FREQ   1000   // PWM frequency in Hz (1 kHz is good for DC motors)
-#define PWM_RES    8      // Resolution: 8 bit → values 0–255
-
+#define ENC_LEFT_PIN   32
+#define ENC_RIGHT_PIN  33
 
 // ==================================================
-// POINTER TO CONNECTED CONTROLLER
+// PID PARAMETERS (tuning)
 // ==================================================
-// ControllerPtr is a pointer provided by Bluepad32.
-// If nullptr → no controller connected.
+float Kp = 0.5;
+float Ki = 0.1;
+float Kd = 0.0;
+
+float pidIntegral = 0;
+float pidLastError = 0;
+unsigned long pidLastTime = 0;
+
+// ==================================================
+// CONTROLLER POINTER
+// ==================================================
 ControllerPtr controller = nullptr;
 
-
 // ==================================================
-// UTILITY FUNCTION: controls ONE motor
+// MOTOR CONTROL
 // ==================================================
-// in1 / in2      → direction pins
-// pwmChannel    → associated PWM channel
-// speed         → speed from -255 to +255
-//
-// speed > 0  → forward
-// speed < 0  → backward
-// speed = 0  → stop
 void setMotor(int in1, int in2, int pwmChannel, int speed) {
+  speed = constrain(speed, -255, 255);
 
-    // Limit speed for safety
-    speed = constrain(speed, -255, 255);
-
-    if (speed > 0) {
-        // Forward rotation
-        digitalWrite(in1, HIGH);
-        digitalWrite(in2, LOW);
-        ledcWrite(pwmChannel, speed);
-    }
-    else if (speed < 0) {
-        // Backward rotation
-        digitalWrite(in1, LOW);
-        digitalWrite(in2, HIGH);
-        ledcWrite(pwmChannel, -speed); // positive value for PWM
-    }
-    else {
-        // Motor stopped
-        ledcWrite(pwmChannel, 0);
-    }
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    ledcWrite(pwmChannel, speed);
+  } else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    ledcWrite(pwmChannel, -speed);
+  } else {
+    ledcWrite(pwmChannel, 0);
+  }
 }
 
-
-// ==================================================
-// TANK DRIVE
-// ==================================================
-// Tank-style control:
-// - left joystick → left track
-// - right joystick → right track
 void tankDrive(int left, int right) {
-    setMotor(AIN1, AIN2, PWM_LEFT,  left);
-    setMotor(BIN1, BIN2, PWM_RIGHT, right);
+  setMotor(AIN1, AIN2, PWM_LEFT_CH, left);
+  setMotor(BIN1, BIN2, PWM_RIGHT_CH, right);
 }
 
+// ==================================================
+// MT6701 PWM → ANGLE
+// ==================================================
+float readAnglePWM(int pin) {
+  unsigned long highT = pulseIn(pin, HIGH, 2000);
+  unsigned long lowT  = pulseIn(pin, LOW, 2000);
+
+  if (highT == 0 || lowT == 0) return NAN;
+
+  float duty = (float)highT / (highT + lowT);
+  return duty * 360.0;
+}
+
+float deltaAngle(float now, float prev) {
+  float d = now - prev;
+  if (d > 180)  d -= 360;
+  if (d < -180) d += 360;
+  return d;
+}
 
 // ==================================================
-// BLUETOOTH CALLBACK: controller connected
+// PID – wheel sync
 // ==================================================
-// This function is called AUTOMATICALLY
-// by Bluepad32 when a controller connects.
+float wheelSyncPID(float speedL, float speedR) {
+  unsigned long now = millis();
+  float dt = (now - pidLastTime) / 1000.0;
+  if (dt <= 0) return 0;
+
+  float error = speedL - speedR;
+  pidIntegral += error * dt;
+  float derivative = (error - pidLastError) / dt;
+
+  float output = Kp * error + Ki * pidIntegral + Kd * derivative;
+
+  pidLastError = error;
+  pidLastTime = now;
+
+  return output;
+}
+
+// ==================================================
+// BLUETOOTH CALLBACKS
+// ==================================================
 void onConnectedController(ControllerPtr ctl) {
-    Serial.println("Controller connected");
-
-    // Save pointer to controller
-    controller = ctl;
-
-    // Turn on LED to indicate active connection
-    digitalWrite(LED_BUILTIN, HIGH);
+  controller = ctl;
+  digitalWrite(LED_BUILTIN, HIGH);
 }
 
-
-// ==================================================
-// BLUETOOTH CALLBACK: controller disconnected
-// ==================================================
 void onDisconnectedController(ControllerPtr ctl) {
-    Serial.println("Controller disconnected");
-
-    // Reset pointer
-    controller = nullptr;
-
-    // LED off → no controller
-    digitalWrite(LED_BUILTIN, LOW);
-
-    // Safety: stop motors immediately
-    tankDrive(0, 0);
+  controller = nullptr;
+  digitalWrite(LED_BUILTIN, LOW);
+  tankDrive(0, 0);
 }
-
 
 // ==================================================
 // SETUP
 // ==================================================
 void setup() {
-    Serial.begin(115200);
+  Serial.begin(115200);
 
-    // ---------- LED ----------
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);   // LED off at startup
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
 
-    // ---------- TB6612 ----------
-    pinMode(AIN1, OUTPUT);
-    pinMode(AIN2, OUTPUT);
-    pinMode(BIN1, OUTPUT);
-    pinMode(BIN2, OUTPUT);
-    pinMode(STBY, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
 
-    // Enable motor driver
-    digitalWrite(STBY, HIGH);
+  ledcSetup(PWM_LEFT_CH,  PWM_FREQ, PWM_RES);
+  ledcSetup(PWM_RIGHT_CH, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PWMA, PWM_LEFT_CH);
+  ledcAttachPin(PWMB, PWM_RIGHT_CH);
 
-    // ---------- PWM ----------
-    ledcSetup(PWM_LEFT,  PWM_FREQ, PWM_RES);
-    ledcSetup(PWM_RIGHT, PWM_FREQ, PWM_RES);
+  pinMode(ENC_LEFT_PIN, INPUT);
+  pinMode(ENC_RIGHT_PIN, INPUT);
 
-    // Attach PWM pins to channels
-    ledcAttachPin(PWMA, PWM_LEFT);
-    ledcAttachPin(PWMB, PWM_RIGHT);
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+  BP32.forgetBluetoothKeys();
 
-    // ---------- Bluepad32 ----------
-    // Register connection/disconnection callbacks
-    BP32.setup(&onConnectedController, &onDisconnectedController);
-
-    // ONLY for initial debug:
-    // clear previous pairings
-    BP32.forgetBluetoothKeys();
-
-    Serial.println("Ready: put the controller in pairing mode");
+  Serial.println("RC Tank ready (PID wheel sync enabled)");
 }
 
-
 // ==================================================
-// MAIN LOOP
+// LOOP
 // ==================================================
 void loop() {
+  BP32.update();
 
-    // Update Bluetooth status (MANDATORY)
-    BP32.update();
+  static float lastAngleL = 0;
+  static float lastAngleR = 0;
+  static unsigned long lastTime = millis();
 
-    // Proceed only if a controller is connected
-    if (controller && controller->isConnected()) {
+  if (!controller || !controller->isConnected()) return;
 
-        // Read Y joystick axes
-        // Note: on many controllers "up" is negative → invert sign
-        int rawLeftY  = -controller->axisY();   // left joystick
-        int rawRightY = -controller->axisRY();  // right joystick
+  int joyL = map(-controller->axisY(),  -512, 512, -255, 255);
+  int joyR = map(-controller->axisRY(), -512, 512, -255, 255);
 
-        // Map Bluepad32 range (-512..512)
-        // to PWM range (-255..255)
-        int leftSpeed  = map(rawLeftY,  -512, 512, -255, 255);
-        int rightSpeed = map(rawRightY, -512, 512, -255, 255);
+  if (abs(joyL) < 20) joyL = 0;
+  if (abs(joyR) < 20) joyR = 0;
 
-        // Deadzone to avoid jitter at rest position
-        if (abs(leftSpeed)  < 20) leftSpeed  = 0;
-        if (abs(rightSpeed) < 20) rightSpeed = 0;
+  // === encoder speed ===
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
 
-        // Debug log: show input → output
-        Serial.printf(
-            "MAP | L:%4d -> %4d   R:%4d -> %4d\n",
-            rawLeftY, leftSpeed,
-            rawRightY, rightSpeed
-        );
+  float angleL = readAnglePWM(ENC_LEFT_PIN);
+  float angleR = readAnglePWM(ENC_RIGHT_PIN);
 
-        // Command motors
-        tankDrive(leftSpeed, rightSpeed);
+  float speedL = 0;
+  float speedR = 0;
 
-        // Delay for:
-        // - avoid serial spam
-        // - avoid watchdog
-        delay(100);
-    }
+  if (!isnan(angleL) && !isnan(angleR) && dt > 0) {
+    speedL = deltaAngle(angleL, lastAngleL) / dt;
+    speedR = deltaAngle(angleR, lastAngleR) / dt;
+    lastAngleL = angleL;
+    lastAngleR = angleR;
+  }
+
+  lastTime = now;
+
+  // === CURVE DETECTION ===
+  int diffJoy = abs(joyL - joyR);
+  float straightFactor = 1.0 - constrain(diffJoy / 255.0, 0.0, 1.0);
+
+  float correction = wheelSyncPID(speedL, speedR) * straightFactor;
+  correction = constrain(correction, -50, 50);
+
+  int motorL = joyL - correction;
+  int motorR = joyR + correction;
+
+  motorL = constrain(motorL, -255, 255);
+  motorR = constrain(motorR, -255, 255);
+
+  tankDrive(motorL, motorR);
+
+  // === DEBUG (Serial Plotter friendly) ===
+  Serial.print(speedL);
+  Serial.print(",");
+  Serial.print(speedR);
+  Serial.print(",");
+  Serial.println(correction);
+
+  delay(20);
 }
